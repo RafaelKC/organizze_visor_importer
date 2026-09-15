@@ -13,13 +13,20 @@ import logging
 from contextlib import AsyncExitStack
 from typing import Any, Callable, Optional
 
+import httpx
 from mcp import ClientSession
 
 try:
-    # mcp>=1.10 renamed this helper.
-    from mcp.client.streamable_http import streamable_http_client as streamablehttp_client
+    # mcp>=1.10 renamed this helper and changed its signature: it no longer
+    # takes `headers=` directly (auth is set on a caller-provided
+    # httpx.AsyncClient instead) and it yields 2 streams instead of 3.
+    from mcp.client.streamable_http import streamable_http_client as _streamable_http_cm
+
+    _NEW_TRANSPORT_API = True
 except ImportError:
-    from mcp.client.streamable_http import streamablehttp_client
+    from mcp.client.streamable_http import streamablehttp_client as _streamable_http_cm
+
+    _NEW_TRANSPORT_API = False
 
 logger = logging.getLogger("visorsync.mcp")
 
@@ -48,9 +55,16 @@ class BaseMcpClient:
     async def __aenter__(self) -> "BaseMcpClient":
         self._stack = AsyncExitStack()
         headers = {"Authorization": f"Bearer {self._token_provider()}"}
-        read, write, _ = await self._stack.enter_async_context(
-            streamablehttp_client(self.mcp_url, headers=headers)
-        )
+        if _NEW_TRANSPORT_API:
+            http_client = await self._stack.enter_async_context(httpx.AsyncClient(headers=headers))
+            streams = await self._stack.enter_async_context(
+                _streamable_http_cm(self.mcp_url, http_client=http_client)
+            )
+        else:
+            streams = await self._stack.enter_async_context(
+                _streamable_http_cm(self.mcp_url, headers=headers)
+            )
+        read, write = streams[0], streams[1]
         self.session = await self._stack.enter_async_context(ClientSession(read, write))
         await self.session.initialize()
         return self
