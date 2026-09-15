@@ -58,11 +58,10 @@ class VisorClient(BaseMcpClient):
             {"category_id": category_id, "confirmed": True, "idempotency_key": idempotency_key},
         )
 
-    async def unhide_category(self, category_id: str, *, idempotency_key: str) -> Any:
-        return await self.call_tool(
-            "unhide_category",
-            {"category_id": category_id, "confirmed": True, "idempotency_key": idempotency_key},
-        )
+    async def unhide_category(self, category_id: str) -> Any:
+        # Real schema has no confirmed/idempotency_key at all (unlike every
+        # other write tool here) -- sending them is rejected as invalid params.
+        return await self.call_tool("unhide_category", {"category_id": category_id})
 
     async def delete_category(self, category_id: str, *, idempotency_key: str) -> Any:
         return await self.call_tool(

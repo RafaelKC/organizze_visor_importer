@@ -83,7 +83,11 @@ async def run(
                 for entity_type, records in plan.items():
                     for record in records:
                         console.print(f"apagando {entity_type} {record.visor_id}...")
-                        await _delete_one(visor, entity_type, record)
+                        try:
+                            await _delete_one(visor, entity_type, record)
+                        except NotImplementedError as exc:
+                            console.print(f"[yellow]{exc}[/yellow]")
+                            continue  # leave it tracked in state.db -- not actually removed
                         store.delete(entity_type, record.visor_id)
 
             if only is None:
@@ -104,9 +108,15 @@ async def _delete_one(visor: VisorClient, entity_type: str, record: EntityRecord
     if entity_type == "transaction":
         await visor.delete_transactions([record.visor_id], idempotency_key=key)
     elif entity_type == "installment_plan":
-        # Não há `delete_installment_plan` documentado nas tools do Visor —
-        # `edit_installment_plan` com cancelamento é o equivalente conhecido.
-        await visor.edit_installment_plan(record.visor_id, idempotency_key=key, cancelled=True)
+        # Confirmed against the real tool schema: there is no delete (or
+        # cancel-via-edit) capability for installment plans at all -- only
+        # create/edit(name, category)/complete/reopen. Nothing to call here;
+        # surface this so the caller can tell the user instead of silently
+        # doing nothing or crashing on an invalid field.
+        raise NotImplementedError(
+            f"Visor has no tool to remove installment plan {record.visor_id} -- "
+            "delete it manually in the app."
+        )
     elif entity_type == "recurring_pattern":
         await visor.deactivate_recurring_pattern(record.visor_id, idempotency_key=key)
     elif entity_type == "manual_account":
@@ -114,7 +124,7 @@ async def _delete_one(visor: VisorClient, entity_type: str, record: EntityRecord
     elif entity_type == "custom_category":
         await visor.delete_category(record.visor_id, idempotency_key=key)
     elif entity_type == "hidden_category":
-        await visor.unhide_category(record.visor_id, idempotency_key=key)
+        await visor.unhide_category(record.visor_id)
     else:
         raise ValueError(f"tipo de entidade desconhecido: {entity_type}")
 

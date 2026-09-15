@@ -68,33 +68,55 @@ async def run(settings: Settings, store: StateStore, *, dry_run: bool = False) -
                     )
 
         # -- custom categories: create if missing --
+        # Visor's create_category takes a name (+ emoji), not a slug -- it
+        # assigns the slug itself. So existing custom categories are matched
+        # by name here, not by the `visor_slug` hint from categories.yaml,
+        # and the real assigned slug is cached in state.db (extra_json) for
+        # migrate.py to use instead of the hint.
         categories = await visor.get_categories(include_hidden=True)
-        by_slug = {c["slug"]: c for c in categories.get("categories", categories) if isinstance(c, dict)}
+        category_list = categories.get("categories", categories) if isinstance(categories, dict) else categories
+        by_name = {c["name"].strip().casefold(): c for c in category_list if isinstance(c, dict)}
 
         for mapping in category_config.mappings:
             if not mapping.is_custom:
                 continue
-            if mapping.visor_slug in by_slug:
+            existing = by_name.get(mapping.organizze_name.strip().casefold())
+            if existing is not None:
                 store.upsert(
                     "category",
-                    by_slug[mapping.visor_slug]["id"],
+                    existing["id"],
                     organizze_id=mapping.organizze_name,
-                    content_hash=mapping.visor_slug,
+                    content_hash=existing["slug"],
                     created_by_tool=False,
+                    extra_json=json.dumps({"resolved_slug": existing["slug"]}),
                 )
                 continue
-            console.print(f"creating custom category: {mapping.organizze_name} -> {mapping.visor_slug}")
+            console.print(f"creating custom category: {mapping.organizze_name} ({mapping.emoji})")
             if dry_run:
                 continue
-            key = _idempotency_key("create_category", mapping.visor_slug)
+            key = _idempotency_key("create_category", mapping.organizze_name)
+            extra_fields: dict[str, str] = {}
+            if mapping.parent_slug:
+                extra_fields["parent_slug"] = mapping.parent_slug
+            elif mapping.category_type:
+                extra_fields["type"] = mapping.category_type
+            else:
+                # Required by Visor for a top-level category; default to
+                # "expense" rather than failing when categories.yaml doesn't
+                # set one explicitly.
+                extra_fields["type"] = "expense"
             result = await visor.create_category(
-                idempotency_key=key, name=mapping.organizze_name, slug=mapping.visor_slug
+                idempotency_key=key,
+                name=mapping.organizze_name,
+                emoji=mapping.emoji,
+                **extra_fields,
             )
             store.upsert(
                 "category",
                 result["id"],
                 organizze_id=mapping.organizze_name,
-                content_hash=mapping.visor_slug,
+                content_hash=result["slug"],
+                extra_json=json.dumps({"resolved_slug": result["slug"]}),
                 created_by_tool=True,
             )
 

@@ -66,12 +66,21 @@ async def run(
     async with OrganizzeClient(settings) as organizze, VisorClient(settings) as visor:
         recurring_names = await _fetch_recurring_names(visor)
 
+        # Balances first, deliberately: update_account_settings has no
+        # historical/dated-balance concept -- it just sets the account's
+        # "current balance" field, which Visor's manual accounts then carry
+        # forward as transactions are added on top (starting-balance +
+        # forward ledger, like a real account). Setting it to the --since
+        # anchor AFTER transactions already existed would just overwrite
+        # away the effect of everything just added. Idempotent re-runs are
+        # still safe: needs_resync-style balance tracking isn't done here,
+        # so this always re-applies the same computed anchor for `since`.
+        await _apply_retroactive_balances(organizze, visor, store, since=since, dry_run=dry_run)
         await _migrate_installments(organizze, visor, store, settings, since=since, until=until, dry_run=dry_run)
         await _migrate_loose_transactions(
             organizze, visor, store, category_config, recurring_names, since=since, until=until, dry_run=dry_run
         )
         await _fix_known_miscategorized_patterns(visor, category_config, dry_run=dry_run)
-        await _apply_retroactive_balances(organizze, visor, store, since=since, dry_run=dry_run)
 
     console.print("[green]migrate done.[/green]")
 
@@ -88,6 +97,20 @@ async def _fetch_recurring_names(visor: VisorClient) -> set[str]:
 
 def _resolved_account(store: StateStore, organizze_account_name: str) -> EntityRecord | None:
     return store.get_by_organizze_id("account", organizze_account_name)
+
+
+def _resolve_category_slug(store: StateStore, category_config, organizze_category_name: str) -> str:
+    mapping = category_config.find_by_organizze_name(organizze_category_name)
+    if mapping is None:
+        return "other"
+    if not mapping.is_custom:
+        return mapping.visor_slug
+    # Visor assigns the slug itself on create_category -- categories.yaml's
+    # visor_slug is only a hint. Use the real slug sync-structure cached.
+    record = store.get_by_organizze_id("category", mapping.organizze_name)
+    if record is not None:
+        return json.loads(record.extra_json or "{}").get("resolved_slug", mapping.visor_slug)
+    return mapping.visor_slug
 
 
 # -- installment plans --------------------------------------------------------
@@ -150,13 +173,24 @@ async def _migrate_installments(
         if dry_run:
             continue
 
+        # current_installment: which installment is "now" for progress
+        # tracking, per the real create_installment_plan schema (there's no
+        # aggregate total-amount field -- only the per-installment amount).
+        # Clamp today's month into the series range for plans that started
+        # in the past or haven't started yet.
+        today_month = _month(date.today().isoformat())
+        current_installment = series.installment_number_for(today_month)
+        if current_installment is None:
+            current_installment = 1 if today_month < series.first_month else series.installments_total
+
         idem_key = _key("create_installment_plan", organizze_key)
         result = await visor.create_installment_plan(
             idempotency_key=idem_key,
             account_id=account_record.visor_id,
             description=series.description,
-            total_amount_cents=series.amount_cents * series.installments_total,
-            installments_total=series.installments_total,
+            installment_amount=f"{series.amount_cents / 100:.2f}",
+            total_installments=series.installments_total,
+            current_installment=current_installment,
             first_installment_date=f"{series.first_month}-01",
         )
         store.upsert(
@@ -219,10 +253,13 @@ async def _migrate_loose_transactions(
                 "(run 'sync-structure' first)[/yellow]"
             )
             continue
-        category_mapping = category_config.find_by_organizze_name(tx.get("category", ""))
-        visor_category_slug = category_mapping.visor_slug if category_mapping else "other"
+        visor_category_slug = _resolve_category_slug(store, category_config, tx.get("category", ""))
 
+        # Organizze convention: positive amount = income/credit, negative =
+        # expense/debit (see mapping/balances.py). Visor's create_manual_transaction
+        # wants a separate, always-positive `amount` plus an explicit `type`.
         amount_cents = round(float(tx.get("amount", 0)) * 100)
+        tx_type = "income" if amount_cents >= 0 else "expense"
         console.print(f"transaction: {tx.get('date')} {description} R${amount_cents / 100:.2f}")
         if dry_run:
             continue
@@ -232,7 +269,8 @@ async def _migrate_loose_transactions(
             idempotency_key=idem_key,
             account_id=account_record.visor_id,
             description=description,
-            amount_cents=amount_cents,
+            type=tx_type,
+            amount=f"{abs(amount_cents) / 100:.2f}",
             date=tx.get("date"),
             category_slug=visor_category_slug,
         )
@@ -318,7 +356,9 @@ async def _apply_retroactive_balances(
         if dry_run:
             continue
 
+        # update_account_settings has no dated-balance concept -- `balance`
+        # is just the account's current value, as a decimal string in BRL.
         key = _key("update_account_settings", record.visor_id, since)
         await visor.update_account_settings(
-            record.visor_id, idempotency_key=key, balance_cents=retro_cents, balance_date=since
+            record.visor_id, idempotency_key=key, balance=f"{retro_cents / 100:.2f}"
         )

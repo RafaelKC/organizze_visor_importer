@@ -1,9 +1,19 @@
-# Category mapping: Organizze category name -> Visor category slug.
+# Category mapping: Organizze category name -> Visor category.
 #
 # Copy this file to $VISORSYNC_HOME/config/categories.yaml and adjust to
-# your own category names and slugs. `is_custom: true` means the category
-# needs to be created in Visor (create_category) if it doesn't exist yet;
-# otherwise it's assumed to be an existing system slug.
+# your own category names. `is_custom: true` means the category needs to be
+# created in Visor (create_category) if it doesn't exist yet by name;
+# `is_custom: false` means it's assumed to already exist as a system
+# category, identified by `visor_slug`.
+#
+# Visor's create_category tool assigns the slug itself from `name` -- you
+# cannot pick it. For `is_custom` entries, `visor_slug` below is only a
+# hint/expected value for your own reference; sync-structure matches
+# existing custom categories by name and caches the real assigned slug in
+# state.db automatically. `emoji` is required by Visor when creating a
+# custom category; `category_type` ("expense"/"income") is required for a
+# new top-level category (omit for a subcategory of `parent_slug`) and
+# defaults to "expense" if left unset.
 
 categories:
   - organizze_name: "Example Category"
@@ -11,8 +21,11 @@ categories:
     is_custom: false
 
   - organizze_name: "Example Custom Category"
-    visor_slug: "example_custom_slug"
+    visor_slug: "example_custom_slug"   # hint only, see note above
     is_custom: true
+    emoji: "🎉"
+    category_type: "expense"           # or "income"; omit if parent_slug is set
+    # parent_slug: "leisure"           # optional: create as a subcategory instead
 
 # Visor system category slugs hidden during this migration -- never used as
 # a mapping destination, and what `reset-visor` reverts (unhide_category)
