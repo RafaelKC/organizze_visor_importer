@@ -112,6 +112,13 @@ class BaseMcpClient:
                 last_error = exc
                 logger.warning("tool %s falhou (tentativa %d/%d): %s", name, attempt, MAX_RETRIES, exc)
             except Exception as exc:  # erro de transporte/rede
+                # The 200-writes/hour cap can also surface as a hard
+                # transport-level rejection (observed: "429" during session
+                # termination, right after a run of otherwise-successful
+                # calls) instead of the soft text-payload case above.
+                # Retrying this immediately is equally pointless.
+                if "429" in str(exc) or "too many requests" in str(exc).lower():
+                    raise RateLimitError(str(exc)) from exc
                 last_error = exc
                 logger.warning("erro de transporte em %s (tentativa %d/%d): %s", name, attempt, MAX_RETRIES, exc)
 

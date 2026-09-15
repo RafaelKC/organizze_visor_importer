@@ -127,6 +127,24 @@ async def run(
                 "duplicated.[/yellow]"
             )
             return
+        except Exception as exc:
+            # The rate limit has also shown up as a generic transport-level
+            # failure after MAX_RETRIES exhausted retries (observed: "429"
+            # on session teardown right after a long run of otherwise-
+            # succeeding calls), not just the two shapes RateLimitError
+            # already recognizes. Whatever the exact cause, a partial batch
+            # is always safe to just stop and resume later here -- nothing
+            # that failed to complete gets written to state.db -- so this
+            # avoids a raw traceback for what is, in practice, almost always
+            # the same rate limit under a different disguise.
+            console.print(
+                f"[red]Stopped due to an unexpected error -- {type(exc).__name__}: {exc}[/red]\n"
+                "[yellow]This is very likely the same Visor rate limit surfacing differently. "
+                "Wait a bit and re-run the same 'migrate' command -- already-created data won't be "
+                "duplicated. If it keeps happening right away (not after a pause), it may be a real "
+                "bug worth reporting.[/yellow]"
+            )
+            return
 
     console.print("[green]migrate done.[/green]")
 
@@ -261,7 +279,12 @@ async def _migrate_installments(
         if current_installment is None:
             current_installment = 1 if today_month < series.first_month else series.installments_total
 
-        idem_key = _key("create_installment_plan", organizze_key)
+        # Keyed on the actual payload (including current_installment, which
+        # shifts over time) -- see the analogous note in
+        # _migrate_loose_transactions for why organizze_key alone isn't safe.
+        idem_key = _key(
+            "create_installment_plan", organizze_key, account_record.visor_id, str(current_installment)
+        )
         result = await visor.create_installment_plan(
             idempotency_key=idem_key,
             account_id=account_record.visor_id,
@@ -368,14 +391,25 @@ async def _migrate_loose_transactions(
         if dry_run:
             continue
 
-        idem_key = _key("create_manual_transaction", organizze_id)
+        iso_date = to_iso_date(tx.get("date"))
+        # Keyed on the actual payload, not just organizze_id: Visor rejects
+        # a reused idempotency_key with "cannot be used for a different
+        # tool call" if the arguments differ from a prior attempt under the
+        # same key. That's exactly what happened across runs during
+        # development, once a bug fix (e.g. the date-format one) changed
+        # what gets sent for the same Organizze transaction -- the old key
+        # was already "spent" against the old, invalid payload.
+        idem_key = _key(
+            "create_manual_transaction", organizze_id, account_record.visor_id,
+            description, tx_type, f"{abs(amount_cents) / 100:.2f}", str(iso_date), visor_category_slug,
+        )
         result = await visor.create_manual_transaction(
             idempotency_key=idem_key,
             account_id=account_record.visor_id,
             description=description,
             type=tx_type,
             amount=f"{abs(amount_cents) / 100:.2f}",
-            date=to_iso_date(tx.get("date")),
+            date=iso_date,
             category_slug=visor_category_slug,
         )
         transaction_id = _extract_id(result, "id", "transaction_id")
