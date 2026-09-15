@@ -28,6 +28,7 @@ from visorsync.mapping.balances import (
     credit_card_balance_at_date,
 )
 from visorsync.mapping.categories import load_category_config
+from visorsync.mapping.dates import to_iso_date
 from visorsync.mapping.installments import (
     RawInstallmentOccurrence,
     resolve_installment_series,
@@ -343,7 +344,7 @@ async def _migrate_loose_transactions(
             description=description,
             type=tx_type,
             amount=f"{abs(amount_cents) / 100:.2f}",
-            date=tx.get("date"),
+            date=to_iso_date(tx.get("date")),
             category_slug=visor_category_slug,
         )
         transaction_id = _extract_id(result, "id", "transaction_id")
@@ -424,8 +425,8 @@ async def _apply_retroactive_balances(
             TransactionForBalance(
                 account=organizze_name,
                 amount_cents=round(parse_brl(r.get("amount", 0)) * 100),
-                date=r.get("date", since),
-                invoice_due_date=r.get("invoice_due_date"),
+                date=to_iso_date(r.get("date")) or since,
+                invoice_due_date=to_iso_date(r.get("invoice_due_date")),
             )
             for r in rows
         ]
