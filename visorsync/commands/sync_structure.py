@@ -105,18 +105,40 @@ async def run(settings: Settings, store: StateStore, *, dry_run: bool = False) -
                 # "expense" rather than failing when categories.yaml doesn't
                 # set one explicitly.
                 extra_fields["type"] = "expense"
-            result = await visor.create_category(
+            await visor.create_category(
                 idempotency_key=key,
                 name=mapping.organizze_name,
                 emoji=mapping.emoji,
                 **extra_fields,
             )
+            # create_category's own response shape isn't documented in its
+            # tool schema (only its inputs are) -- rather than guess at
+            # result["id"]/result["slug"], re-read get_categories (whose
+            # shape IS documented: id/slug/name/emoji/type/parent) and find
+            # the category we just created by name, the same way existing
+            # ones are matched above.
+            refreshed = await visor.get_categories(include_hidden=True)
+            refreshed_list = refreshed.get("categories", refreshed) if isinstance(refreshed, dict) else refreshed
+            created = next(
+                (
+                    c
+                    for c in refreshed_list
+                    if isinstance(c, dict) and c.get("name", "").strip().casefold() == mapping.organizze_name.strip().casefold()
+                ),
+                None,
+            )
+            if created is None:
+                console.print(
+                    f"[red]created '{mapping.organizze_name}' but couldn't find it again in "
+                    "get_categories -- check the app and re-run sync-structure.[/red]"
+                )
+                continue
             store.upsert(
                 "category",
-                result["id"],
+                created["id"],
                 organizze_id=mapping.organizze_name,
-                content_hash=result["slug"],
-                extra_json=json.dumps({"resolved_slug": result["slug"]}),
+                content_hash=created["slug"],
+                extra_json=json.dumps({"resolved_slug": created["slug"]}),
                 created_by_tool=True,
             )
 

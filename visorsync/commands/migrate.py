@@ -49,6 +49,30 @@ def _month(d: str) -> str:
     return d[:7]
 
 
+def _extract_id(result: object, *candidate_keys: str) -> str | None:
+    """Best-effort id extraction from a write tool's result.
+
+    Only *input* schemas were confirmed against the real Visor MCP tools;
+    their result shapes aren't documented, and calling them just to see the
+    shape would create real data in the user's account. Tries a few common
+    key names and a one-level {"data": {...}}-style wrapper; returns None
+    (never raises) so the caller can log and move on instead of crashing
+    the whole batch over one unexpected response shape.
+    """
+    if not isinstance(result, dict):
+        return None
+    for key in candidate_keys:
+        if key in result:
+            return result[key]
+    for wrapper_key in ("data", "result", "transaction", "installment_plan", "plan"):
+        wrapped = result.get(wrapper_key)
+        if isinstance(wrapped, dict):
+            for key in candidate_keys:
+                if key in wrapped:
+                    return wrapped[key]
+    return None
+
+
 def _account_kind(record: EntityRecord) -> str:
     return json.loads(record.extra_json or "{}").get("kind", "bank")
 
@@ -193,9 +217,17 @@ async def _migrate_installments(
             current_installment=current_installment,
             first_installment_date=f"{series.first_month}-01",
         )
+        plan_id = _extract_id(result, "id", "plan_id")
+        if plan_id is None:
+            console.print(
+                f"[red]created installment plan for '{series.description}' but couldn't read its id "
+                f"back from the response ({result!r}) -- it won't be tracked in state.db and may be "
+                "recreated on the next run. Check the app.[/red]"
+            )
+            continue
         store.upsert(
             "installment_plan",
-            result["id"],
+            plan_id,
             organizze_id=organizze_key,
             content_hash=content_hash,
             created_by_tool=True,
@@ -274,9 +306,17 @@ async def _migrate_loose_transactions(
             date=tx.get("date"),
             category_slug=visor_category_slug,
         )
+        transaction_id = _extract_id(result, "id", "transaction_id")
+        if transaction_id is None:
+            console.print(
+                f"[red]created transaction '{description}' but couldn't read its id back from "
+                f"the response ({result!r}) -- it won't be tracked in state.db and may be "
+                "recreated on the next run. Check the app.[/red]"
+            )
+            continue
         store.upsert(
             "transaction",
-            result["id"],
+            transaction_id,
             organizze_id=organizze_id,
             content_hash=content_hash,
             created_by_tool=True,
