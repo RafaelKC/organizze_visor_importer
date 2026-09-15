@@ -1,0 +1,324 @@
+"""Phase 2: one-off transactions, installment plans, retroactive balances and
+recurring-pattern category fixes -- idempotent via state.db.
+
+Account/card resolution reads state.db (populated by `sync-structure`,
+which resolves Organizze accounts to Visor accounts/cards by name) rather
+than any hardcoded table, so no personal account IDs live in this repo.
+Recurring-pattern names/amounts are fetched live from Visor -- never
+hardcoded either.
+
+Field names read from MCP responses (`description`, `amount`, `account`,
+`invoice_due_date`, etc.) follow the shape observed during the manual chat
+migration; since this CLI hasn't run against the real servers outside a
+chat session yet, double check the exact schema on first real run and
+adjust the `_extract_*` helpers below if a field name has changed.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import date, timedelta
+
+from rich.console import Console
+
+from visorsync.config import Settings
+from visorsync.mapping.balances import (
+    TransactionForBalance,
+    bank_balance_at_date,
+    credit_card_balance_at_date,
+)
+from visorsync.mapping.categories import load_category_config
+from visorsync.mapping.installments import (
+    RawInstallmentOccurrence,
+    resolve_installment_series,
+    series_active_in_range,
+)
+from visorsync.mapping.recurring import index_by_name
+from visorsync.mcp_clients.organizze_client import OrganizzeClient
+from visorsync.mcp_clients.visor_client import VisorClient
+from visorsync.state.store import EntityRecord, StateStore
+
+console = Console()
+
+
+def _key(*parts: str) -> str:
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+
+
+def _month(d: str) -> str:
+    return d[:7]
+
+
+def _account_kind(record: EntityRecord) -> str:
+    return json.loads(record.extra_json or "{}").get("kind", "bank")
+
+
+async def run(
+    settings: Settings,
+    store: StateStore,
+    *,
+    since: str,
+    until: str,
+    dry_run: bool,
+) -> None:
+    category_config = load_category_config(settings.config_dir)
+
+    async with OrganizzeClient(settings) as organizze, VisorClient(settings) as visor:
+        recurring_names = await _fetch_recurring_names(visor)
+
+        await _migrate_installments(organizze, visor, store, settings, since=since, until=until, dry_run=dry_run)
+        await _migrate_loose_transactions(
+            organizze, visor, store, category_config, recurring_names, since=since, until=until, dry_run=dry_run
+        )
+        await _fix_known_miscategorized_patterns(visor, category_config, dry_run=dry_run)
+        await _apply_retroactive_balances(organizze, visor, store, since=since, dry_run=dry_run)
+
+    console.print("[green]migrate done.[/green]")
+
+
+async def _fetch_recurring_names(visor: VisorClient) -> set[str]:
+    expenses = await visor.get_recurring_expenses()
+    incomes = await visor.get_recurring_incomes()
+    by_name = index_by_name(
+        expenses.get("patterns", expenses) if isinstance(expenses, dict) else expenses,
+        incomes.get("patterns", incomes) if isinstance(incomes, dict) else incomes,
+    )
+    return set(by_name)
+
+
+def _resolved_account(store: StateStore, organizze_account_name: str) -> EntityRecord | None:
+    return store.get_by_organizze_id("account", organizze_account_name)
+
+
+# -- installment plans --------------------------------------------------------
+
+
+async def _migrate_installments(
+    organizze: OrganizzeClient,
+    visor: VisorClient,
+    store: StateStore,
+    settings: Settings,
+    *,
+    since: str,
+    until: str,
+    dry_run: bool,
+) -> None:
+    lookback_start = (date.fromisoformat(since) - timedelta(days=730)).isoformat()
+    raw = await organizze.find_installments(lookback_start, until)
+    occurrences = _parse_raw_installments(raw)
+    if not occurrences:
+        console.print("[yellow]find_installments returned no occurrences.[/yellow]")
+        return
+
+    earliest_available_month = min(_month(o.month + "-01") if len(o.month) == 7 else _month(o.month) for o in occurrences)
+    resolved, ambiguous = resolve_installment_series(
+        occurrences, earliest_available_month=earliest_available_month
+    )
+
+    if ambiguous:
+        settings.ambiguous_report_path.write_text(
+            json.dumps([a.__dict__ for a in ambiguous], indent=2, ensure_ascii=False, default=list)
+        )
+        console.print(
+            f"[yellow]{len(ambiguous)} ambiguous installment series -- review "
+            f"{settings.ambiguous_report_path} before re-running.[/yellow]"
+        )
+
+    since_month, until_month = _month(since), _month(until)
+    for series in resolved:
+        if not series_active_in_range(series, since_month, until_month):
+            continue
+
+        organizze_key = f"{series.description}|{series.account}|{series.amount_cents}|{series.installments_total}"
+        content_hash = _key(organizze_key, series.first_month)
+        if not store.needs_resync("installment_plan", organizze_key, content_hash):
+            continue
+
+        account_record = _resolved_account(store, series.account)
+        if account_record is None:
+            console.print(
+                f"[yellow]skipping installment plan, no resolved account: {series.account} "
+                "(run 'sync-structure' first)[/yellow]"
+            )
+            continue
+
+        console.print(
+            f"installment plan: {series.description} ({series.account}) -- "
+            f"{series.installments_total}x of R${series.amount_cents / 100:.2f}, "
+            f"starting {series.first_month}"
+        )
+        if dry_run:
+            continue
+
+        idem_key = _key("create_installment_plan", organizze_key)
+        result = await visor.create_installment_plan(
+            idempotency_key=idem_key,
+            account_id=account_record.visor_id,
+            description=series.description,
+            total_amount_cents=series.amount_cents * series.installments_total,
+            installments_total=series.installments_total,
+            first_installment_date=f"{series.first_month}-01",
+        )
+        store.upsert(
+            "installment_plan",
+            result["id"],
+            organizze_id=organizze_key,
+            content_hash=content_hash,
+            created_by_tool=True,
+        )
+
+
+def _parse_raw_installments(raw: object) -> list[RawInstallmentOccurrence]:
+    rows = raw.get("installments", raw) if isinstance(raw, dict) else raw
+    occurrences: list[RawInstallmentOccurrence] = []
+    for row in rows or []:
+        occurrences.append(
+            RawInstallmentOccurrence(
+                description=row["description"],
+                account=row["account"],
+                amount_cents=round(float(row["amount"]) * 100),
+                installments_total=int(row["installments_total"]),
+                month=_month(row["date"]) if len(row.get("date", "")) > 7 else row.get("month", row.get("date")),
+            )
+        )
+    return occurrences
+
+
+# -- one-off transactions ------------------------------------------------------
+
+
+async def _migrate_loose_transactions(
+    organizze: OrganizzeClient,
+    visor: VisorClient,
+    store: StateStore,
+    category_config,
+    recurring_names: set[str],
+    *,
+    since: str,
+    until: str,
+    dry_run: bool,
+) -> None:
+    transactions = await organizze.list_all_transactions(since, until)
+
+    for tx in transactions:
+        organizze_id = str(tx.get("id") or tx.get("transaction_id"))
+        description = tx.get("description", "")
+        if tx.get("installment_id") or tx.get("is_installment"):
+            continue  # handled in _migrate_installments
+        if description in recurring_names:
+            continue  # already covered by the matching recurring pattern
+
+        content_hash = _key(json.dumps(tx, sort_keys=True, default=str))
+        if not store.needs_resync("transaction", organizze_id, content_hash):
+            continue
+
+        account_record = _resolved_account(store, tx.get("account", ""))
+        if account_record is None:
+            console.print(
+                f"[yellow]skipping transaction, no resolved account: {description} "
+                "(run 'sync-structure' first)[/yellow]"
+            )
+            continue
+        category_mapping = category_config.find_by_organizze_name(tx.get("category", ""))
+        visor_category_slug = category_mapping.visor_slug if category_mapping else "other"
+
+        amount_cents = round(float(tx.get("amount", 0)) * 100)
+        console.print(f"transaction: {tx.get('date')} {description} R${amount_cents / 100:.2f}")
+        if dry_run:
+            continue
+
+        idem_key = _key("create_manual_transaction", organizze_id)
+        result = await visor.create_manual_transaction(
+            idempotency_key=idem_key,
+            account_id=account_record.visor_id,
+            description=description,
+            amount_cents=amount_cents,
+            date=tx.get("date"),
+            category_slug=visor_category_slug,
+        )
+        store.upsert(
+            "transaction",
+            result["id"],
+            organizze_id=organizze_id,
+            content_hash=content_hash,
+            created_by_tool=True,
+        )
+
+
+# -- known miscategorized recurring patterns (e.g. Disney+) --------------------
+
+
+async def _fix_known_miscategorized_patterns(visor: VisorClient, category_config, *, dry_run: bool) -> None:
+    if not category_config.known_miscategorized_patterns:
+        return
+    patterns = await visor.get_recurring_expenses()
+    by_name = {p["name"]: p for p in patterns.get("patterns", patterns) if isinstance(p, dict)}
+
+    for fix in category_config.known_miscategorized_patterns:
+        pattern = by_name.get(fix.pattern_name)
+        if pattern is None or pattern.get("category_slug") == fix.correct_slug:
+            continue
+        console.print(f"fixing category for '{fix.pattern_name}' -> {fix.correct_slug}")
+        if dry_run:
+            continue
+        try:
+            key = _key("update_recurring_pattern", pattern["id"], fix.correct_slug)
+            await visor.update_recurring_pattern(
+                pattern["id"], idempotency_key=key, category_slug=fix.correct_slug
+            )
+        except Exception as exc:  # retry/backoff already lives in BaseMcpClient
+            console.print(
+                f"[red]failed to fix '{fix.pattern_name}' after retries: {exc}. "
+                "Logged for manual review in the app.[/red]"
+            )
+
+
+# -- retroactive balances -------------------------------------------------------
+
+
+async def _apply_retroactive_balances(
+    organizze: OrganizzeClient,
+    visor: VisorClient,
+    store: StateStore,
+    *,
+    since: str,
+    dry_run: bool,
+) -> None:
+    balances = await organizze.get_balances()
+    today = date.today().isoformat()
+
+    for record in store.list_by_type("account"):
+        organizze_name = record.organizze_id
+        current = balances.get(organizze_name)
+        if current is None:
+            continue
+        current_cents = round(float(current) * 100)
+
+        rows = await organizze.list_all_transactions(since, today, account_id=organizze_name)
+        txs = [
+            TransactionForBalance(
+                account=organizze_name,
+                amount_cents=round(float(r.get("amount", 0)) * 100),
+                date=r.get("date", since),
+                invoice_due_date=r.get("invoice_due_date"),
+            )
+            for r in rows
+        ]
+
+        if _account_kind(record) == "bank":
+            retro_cents = bank_balance_at_date(
+                current_balance_cents=current_cents, transactions=txs, since_date=since
+            )
+        else:
+            retro_cents = credit_card_balance_at_date(
+                current_open_invoice_cents=current_cents, transactions=txs, since_date=since
+            )
+
+        console.print(f"retroactive balance {organizze_name} on {since}: R${retro_cents / 100:.2f}")
+        if dry_run:
+            continue
+
+        key = _key("update_account_settings", record.visor_id, since)
+        await visor.update_account_settings(
+            record.visor_id, idempotency_key=key, balance_cents=retro_cents, balance_date=since
+        )

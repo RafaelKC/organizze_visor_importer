@@ -1,0 +1,33 @@
+# Category mapping: Organizze category name -> Visor category slug.
+#
+# Copy this file to $VISORSYNC_HOME/config/categories.yaml and adjust to
+# your own category names and slugs. `is_custom: true` means the category
+# needs to be created in Visor (create_category) if it doesn't exist yet;
+# otherwise it's assumed to be an existing system slug.
+
+categories:
+  - organizze_name: "Example Category"
+    visor_slug: "example-slug"
+    is_custom: false
+
+  - organizze_name: "Example Custom Category"
+    visor_slug: "example_custom_slug"
+    is_custom: true
+
+# Visor system category slugs hidden during this migration -- never used as
+# a mapping destination, and what `reset-visor` reverts (unhide_category)
+# if they were hidden by this tool.
+hidden_system_category_slugs:
+  - "example-hidden-slug"
+
+# Category trees you want left exactly as-is -- sync-structure/migrate will
+# never touch these.
+protected_category_trees:
+  - "example-protected-tree"
+
+# Known cases where a recurring pattern ended up under the wrong category
+# and needs manual review/retry (see commands/sync_structure.py).
+known_miscategorized_patterns:
+  - pattern_name: "Example Pattern"
+    current_slug: "wrong-slug"
+    correct_slug: "right-slug"
