@@ -104,9 +104,12 @@ async def run(
         # so this always re-applies the same computed anchor for `since`.
         try:
             await _apply_retroactive_balances(organizze, visor, store, since=since, dry_run=dry_run)
-            await _migrate_installments(organizze, visor, store, settings, since=since, until=until, dry_run=dry_run)
+            installment_keys = await _migrate_installments(
+                organizze, visor, store, settings, since=since, until=until, dry_run=dry_run
+            )
             await _migrate_loose_transactions(
-                organizze, visor, store, category_config, recurring_names, since=since, until=until, dry_run=dry_run
+                organizze, visor, store, category_config, recurring_names, installment_keys,
+                since=since, until=until, dry_run=dry_run
             )
             await _fix_known_miscategorized_patterns(visor, category_config, dry_run=dry_run)
         except RateLimitError as exc:
@@ -168,13 +171,26 @@ async def _migrate_installments(
     since: str,
     until: str,
     dry_run: bool,
-) -> None:
+) -> set[tuple[str, str]]:
+    """Returns the (description, account) pairs covered by an installment
+    series active in [since, until] -- used by `_migrate_loose_transactions`
+    to skip these instead of creating duplicate one-off transactions.
+
+    There's no reliable per-transaction "this belongs to a plan" flag in
+    Organizze's transaction records (`repeat_total`/`repeat_index` also
+    appears, with large values like 106, on ordinary recurring bills that
+    have nothing to do with installments), so this list -- the same
+    resolved series used to create the plans -- is the actual source of
+    truth for what to exclude.
+    """
+    installment_keys: set[tuple[str, str]] = set()
+
     lookback_start = (date.fromisoformat(since) - timedelta(days=730)).isoformat()
     raw = await organizze.find_installments(lookback_start, until)
     occurrences = _parse_raw_installments(raw)
     if not occurrences:
         console.print("[yellow]find_installments returned no occurrences.[/yellow]")
-        return
+        return installment_keys
 
     earliest_available_month = min(_month(o.month + "-01") if len(o.month) == 7 else _month(o.month) for o in occurrences)
     resolved, ambiguous = resolve_installment_series(
@@ -195,11 +211,6 @@ async def _migrate_installments(
         if not series_active_in_range(series, since_month, until_month):
             continue
 
-        organizze_key = f"{series.description}|{series.account}|{series.amount_cents}|{series.installments_total}"
-        content_hash = _key(organizze_key, series.first_month)
-        if not store.needs_resync("installment_plan", organizze_key, content_hash):
-            continue
-
         account_record = _resolved_account(store, series.account)
         if account_record is None:
             console.print(
@@ -211,14 +222,25 @@ async def _migrate_installments(
             # create_installment_plan only accepts a credit-card account_id.
             # find_installments can surface "installments" on a bank account
             # too (e.g. a split bank loan/deposit) -- there's no Visor tool
-            # for that, so it's routed to loose-transaction migration instead
-            # by simply not creating a plan; the underlying transactions
-            # still get migrated individually by _migrate_loose_transactions.
+            # for that, so it's NOT added to installment_keys: the
+            # underlying transactions fall through and get migrated
+            # individually by _migrate_loose_transactions instead.
             console.print(
                 f"[yellow]skipping installment plan on non-credit account: "
                 f"{series.description} ({series.account}) -- Visor's create_installment_plan "
                 "only supports credit cards.[/yellow]"
             )
+            continue
+
+        # From here on the series has a real (or already-created) Visor
+        # plan representing it, so its transactions must never also be
+        # created as loose one-offs -- add the key whether this run creates
+        # the plan now or it was already created in a previous run.
+        installment_keys.add((series.description, series.account))
+
+        organizze_key = f"{series.description}|{series.account}|{series.amount_cents}|{series.installments_total}"
+        content_hash = _key(organizze_key, series.first_month)
+        if not store.needs_resync("installment_plan", organizze_key, content_hash):
             continue
 
         console.print(
@@ -265,6 +287,8 @@ async def _migrate_installments(
             created_by_tool=True,
         )
 
+    return installment_keys
+
 
 def _parse_raw_installments(raw: object) -> list[RawInstallmentOccurrence]:
     """Each group from find_installments already carries a `months` list
@@ -300,6 +324,7 @@ async def _migrate_loose_transactions(
     store: StateStore,
     category_config,
     recurring_names: set[str],
+    installment_keys: set[tuple[str, str]],
     *,
     since: str,
     until: str,
@@ -310,7 +335,13 @@ async def _migrate_loose_transactions(
     for tx in transactions:
         organizze_id = str(tx.get("id") or tx.get("transaction_id"))
         description = tx.get("description", "")
-        if tx.get("installment_id") or tx.get("is_installment"):
+        account = tx.get("account", "")
+        # Organizze's transaction records have no reliable "this belongs to
+        # an installment plan" flag: `repeat_total`/`repeat_index` also
+        # shows up (with large values like 106) on ordinary recurring
+        # bills. installment_keys -- the same resolved series used to
+        # create the actual plans -- is the real source of truth here.
+        if (description, account) in installment_keys:
             continue  # handled in _migrate_installments
         if description in recurring_names:
             continue  # already covered by the matching recurring pattern
@@ -319,7 +350,7 @@ async def _migrate_loose_transactions(
         if not store.needs_resync("transaction", organizze_id, content_hash):
             continue
 
-        account_record = _resolved_account(store, tx.get("account", ""))
+        account_record = _resolved_account(store, account)
         if account_record is None:
             console.print(
                 f"[yellow]skipping transaction, no resolved account: {description} "
