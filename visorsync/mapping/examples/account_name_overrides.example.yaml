@@ -1,0 +1,9 @@
+# Optional: only needed when the same account/card was named differently
+# in Organizze vs. Visor (e.g. Organizze "Conta Inter" vs. Visor "Inter").
+# Holds text labels only -- no IDs, no amounts -- so it's safe to commit if
+# you ever wanted to, but it still lives under $VISORSYNC_HOME/config like
+# the other per-user config, seeded here on first run.
+#
+# organizze_name: visor_name
+overrides:
+  "Example Organizze Name": "Example Visor Name"

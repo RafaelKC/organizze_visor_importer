@@ -14,7 +14,7 @@ import json
 from rich.console import Console
 
 from visorsync.config import Settings
-from visorsync.mapping.accounts import resolve_accounts
+from visorsync.mapping.accounts import load_name_overrides, resolve_accounts
 from visorsync.mapping.categories import load_category_config
 from visorsync.mcp_clients.organizze_client import OrganizzeClient
 from visorsync.mcp_clients.visor_client import VisorClient
@@ -40,8 +40,9 @@ async def run(settings: Settings, store: StateStore, *, dry_run: bool = False) -
         visor_accounts = [a for a in visor_accounts_resp.get("accounts", visor_accounts_resp) if isinstance(a, dict)]
         visor_cards = [c for c in visor_cards_resp.get("cards", visor_cards_resp) if isinstance(c, dict)]
 
+        name_overrides = load_name_overrides(settings.config_dir)
         resolved, unresolved = resolve_accounts(
-            organizze_accounts, organizze_cards, visor_accounts, visor_cards
+            organizze_accounts, organizze_cards, visor_accounts, visor_cards, name_overrides
         )
 
         for name in unresolved:

@@ -9,12 +9,20 @@ the values are*.
 """
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
+
+from visorsync.mapping.loader import ensure_config_dir, load_yaml
 
 
 def _normalize(name: str) -> str:
-    return name.strip().casefold()
+    # NFKC first: Organizze and Visor can encode the same accented text with
+    # different Unicode normal forms (e.g. precomposed "ã" vs "a" + combining
+    # tilde) -- those look identical printed but compare unequal otherwise,
+    # which silently failed every match on a name containing "Cartão".
+    return unicodedata.normalize("NFKC", name).strip().casefold()
 
 
 @dataclass(frozen=True)
@@ -83,3 +91,15 @@ def resolve_accounts(
         )
 
     return resolved, unresolved
+
+
+def load_name_overrides(config_dir: Path) -> dict[str, str]:
+    """Loads the optional Organizze-name -> Visor-name override table.
+
+    Only needed when the same account/card was named differently in each
+    app. Seeded on first run with a placeholder example; an empty/default
+    file means no overrides, which is the common case.
+    """
+    ensure_config_dir(config_dir)
+    data = load_yaml(config_dir, "account_name_overrides.yaml")
+    return dict(data.get("overrides", {}))
