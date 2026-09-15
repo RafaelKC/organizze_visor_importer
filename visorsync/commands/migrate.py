@@ -33,7 +33,9 @@ from visorsync.mapping.installments import (
     resolve_installment_series,
     series_active_in_range,
 )
+from visorsync.mapping.money import parse_brl
 from visorsync.mapping.recurring import index_by_name
+from visorsync.mcp_clients.base import RateLimitError
 from visorsync.mcp_clients.organizze_client import OrganizzeClient
 from visorsync.mcp_clients.visor_client import VisorClient
 from visorsync.state.store import EntityRecord, StateStore
@@ -99,12 +101,28 @@ async def run(
         # away the effect of everything just added. Idempotent re-runs are
         # still safe: needs_resync-style balance tracking isn't done here,
         # so this always re-applies the same computed anchor for `since`.
-        await _apply_retroactive_balances(organizze, visor, store, since=since, dry_run=dry_run)
-        await _migrate_installments(organizze, visor, store, settings, since=since, until=until, dry_run=dry_run)
-        await _migrate_loose_transactions(
-            organizze, visor, store, category_config, recurring_names, since=since, until=until, dry_run=dry_run
-        )
-        await _fix_known_miscategorized_patterns(visor, category_config, dry_run=dry_run)
+        try:
+            await _apply_retroactive_balances(organizze, visor, store, since=since, dry_run=dry_run)
+            await _migrate_installments(organizze, visor, store, settings, since=since, until=until, dry_run=dry_run)
+            await _migrate_loose_transactions(
+                organizze, visor, store, category_config, recurring_names, since=since, until=until, dry_run=dry_run
+            )
+            await _fix_known_miscategorized_patterns(visor, category_config, dry_run=dry_run)
+        except RateLimitError as exc:
+            # Visor enforces a hard cap ("200 changes per hour through the
+            # assistant") on write tools. Retrying immediately can't help,
+            # and continuing would just burn through the rest of the batch
+            # generating identical failures. Stop cleanly instead: nothing
+            # that failed got written to state.db, so re-running `migrate`
+            # later picks up exactly where this left off (idempotent), once
+            # the hourly quota resets.
+            console.print(
+                f"[red]Stopped: Visor rate limit hit -- {exc}[/red]\n"
+                "[yellow]Wait for the quota to reset, then re-run the same 'migrate' command -- "
+                "already-created accounts/balances/installment plans/transactions won't be "
+                "duplicated.[/yellow]"
+            )
+            return
 
     console.print("[green]migrate done.[/green]")
 
@@ -188,6 +206,19 @@ async def _migrate_installments(
                 "(run 'sync-structure' first)[/yellow]"
             )
             continue
+        if _account_kind(account_record) != "credit":
+            # create_installment_plan only accepts a credit-card account_id.
+            # find_installments can surface "installments" on a bank account
+            # too (e.g. a split bank loan/deposit) -- there's no Visor tool
+            # for that, so it's routed to loose-transaction migration instead
+            # by simply not creating a plan; the underlying transactions
+            # still get migrated individually by _migrate_loose_transactions.
+            console.print(
+                f"[yellow]skipping installment plan on non-credit account: "
+                f"{series.description} ({series.account}) -- Visor's create_installment_plan "
+                "only supports credit cards.[/yellow]"
+            )
+            continue
 
         console.print(
             f"installment plan: {series.description} ({series.account}) -- "
@@ -235,18 +266,27 @@ async def _migrate_installments(
 
 
 def _parse_raw_installments(raw: object) -> list[RawInstallmentOccurrence]:
+    """Each group from find_installments already carries a `months` list
+    (e.g. ["2026-03", "2026-04", ...]) for that (description, account,
+    amount, installments_total) combination -- not one row per month. The
+    reconstruction algorithm in mapping/installments.py still needs to see
+    one occurrence per month (that's the unit it groups/merges fragments
+    on), so each group is expanded here.
+    """
     rows = raw.get("installments", raw) if isinstance(raw, dict) else raw
     occurrences: list[RawInstallmentOccurrence] = []
     for row in rows or []:
-        occurrences.append(
-            RawInstallmentOccurrence(
-                description=row["description"],
-                account=row["account"],
-                amount_cents=round(float(row["amount"]) * 100),
-                installments_total=int(row["installments_total"]),
-                month=_month(row["date"]) if len(row.get("date", "")) > 7 else row.get("month", row.get("date")),
+        amount_cents = round(parse_brl(row["amount"]) * 100)
+        for month in row.get("months", []):
+            occurrences.append(
+                RawInstallmentOccurrence(
+                    description=row["description"],
+                    account=row["account"],
+                    amount_cents=amount_cents,
+                    installments_total=int(row["installments_total"]),
+                    month=month,
+                )
             )
-        )
     return occurrences
 
 
@@ -290,7 +330,7 @@ async def _migrate_loose_transactions(
         # Organizze convention: positive amount = income/credit, negative =
         # expense/debit (see mapping/balances.py). Visor's create_manual_transaction
         # wants a separate, always-positive `amount` plus an explicit `type`.
-        amount_cents = round(float(tx.get("amount", 0)) * 100)
+        amount_cents = round(parse_brl(tx.get("amount", 0)) * 100)
         tx_type = "income" if amount_cents >= 0 else "expense"
         console.print(f"transaction: {tx.get('date')} {description} R${amount_cents / 100:.2f}")
         if dry_run:
@@ -362,28 +402,36 @@ async def _apply_retroactive_balances(
     since: str,
     dry_run: bool,
 ) -> None:
-    balances = await organizze.get_balances()
+    # get_balances() returns {"accounts": [{"name", "balance_in_cents", ...}],
+    # "credit_cards": [{"name", "open_invoice_in_cents", ...}], "totals": {...}}
+    # -- not a flat name -> value map. Both cent fields are already signed
+    # integers (negative = debt/debit), so no string parsing is needed.
+    balances_resp = await organizze.get_balances()
+    balance_by_name = {a["name"]: a["balance_in_cents"] for a in balances_resp.get("accounts", [])}
+    balance_by_name.update(
+        {c["name"]: c["open_invoice_in_cents"] for c in balances_resp.get("credit_cards", [])}
+    )
     today = date.today().isoformat()
 
     for record in store.list_by_type("account"):
         organizze_name = record.organizze_id
-        current = balances.get(organizze_name)
-        if current is None:
+        current_cents = balance_by_name.get(organizze_name)
+        if current_cents is None:
             continue
-        current_cents = round(float(current) * 100)
 
         rows = await organizze.list_all_transactions(since, today, account_id=organizze_name)
         txs = [
             TransactionForBalance(
                 account=organizze_name,
-                amount_cents=round(float(r.get("amount", 0)) * 100),
+                amount_cents=round(parse_brl(r.get("amount", 0)) * 100),
                 date=r.get("date", since),
                 invoice_due_date=r.get("invoice_due_date"),
             )
             for r in rows
         ]
 
-        if _account_kind(record) == "bank":
+        is_bank = _account_kind(record) == "bank"
+        if is_bank:
             retro_cents = bank_balance_at_date(
                 current_balance_cents=current_cents, transactions=txs, since_date=since
             )
@@ -392,7 +440,14 @@ async def _apply_retroactive_balances(
                 current_open_invoice_cents=current_cents, transactions=txs, since_date=since
             )
 
-        console.print(f"retroactive balance {organizze_name} on {since}: R${retro_cents / 100:.2f}")
+        # Organizze represents an open invoice as negative (debt); Visor's
+        # manual credit accounts most likely want the amount owed as a
+        # positive number, matching how it's normally displayed. Unverified
+        # (no CREDIT-type account exists to check against yet) -- check the
+        # first card's balance in the app after this runs.
+        display_cents = retro_cents if is_bank else abs(retro_cents)
+
+        console.print(f"retroactive balance {organizze_name} on {since}: R${display_cents / 100:.2f}")
         if dry_run:
             continue
 
@@ -400,5 +455,5 @@ async def _apply_retroactive_balances(
         # is just the account's current value, as a decimal string in BRL.
         key = _key("update_account_settings", record.visor_id, since)
         await visor.update_account_settings(
-            record.visor_id, idempotency_key=key, balance=f"{retro_cents / 100:.2f}"
+            record.visor_id, idempotency_key=key, balance=f"{display_cents / 100:.2f}"
         )

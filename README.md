@@ -45,10 +45,14 @@ Account IDs, card limits, balances and recurring-pattern amounts (salary,
 rent, etc.) are never hardcoded in code or committed to git:
 
 - **Accounts/cards** are resolved by *name*, at runtime, against the live
-  Visor account/card list (`get_accounts`/`get_cards`) -- `sync-structure`
-  matches them and caches the resolved `organizze_name <-> visor_id` pair in
-  the local, gitignored `state.db`. There's no account-ID config file at
-  all.
+  Visor account list (`get_accounts` -- Visor's `get_cards` is a different
+  concept, named cardholders' physical card numbers, not credit-card
+  accounts). `sync-structure` matches them and caches the resolved
+  `organizze_name <-> visor_id` pair in the local, gitignored `state.db`.
+  If an account/card doesn't exist yet in Visor -- never created, or
+  removed by `reset-visor --include-manual` -- it's created via
+  `create_manual_account` using Organizze's own billing days/limit for
+  credit cards. There's no account-ID config file at all.
 - **Recurring pattern amounts** are fetched live from Visor
   (`get_recurring_expenses`/`get_recurring_incomes`) every run, never
   stored.
@@ -177,13 +181,25 @@ pytest -v
 
 ## Known open items
 
-- Organizze accounts with no matching Visor account/card (by name) are
-  reported as unresolved and skipped rather than guessed at -- decide their
-  destination and create/rename the account in Visor, or add it to
-  `unmapped_accounts` handling if it should be skipped intentionally.
+- **Visor enforces a hard cap of 200 write operations per hour** ("You've
+  reached the limit of 200 changes per hour through the assistant"),
+  confirmed by running a real migration. This comes back as ordinary
+  (non-error) text content rather than a tool error, so `mcp_clients/base.py`
+  detects the message and raises `RateLimitError` immediately instead of
+  burning through the retry budget. `migrate` catches it and stops cleanly:
+  nothing that failed is written to `state.db`, so re-running the same
+  command later resumes exactly where it left off once the quota resets.
+  A full year of transaction history will need several separate runs
+  spread across multiple hourly windows.
+- Organizze accounts with no matching Visor account (by name) are created
+  via `create_manual_account` if they don't exist yet; there's no config
+  needed for accounts that already exist under the same name.
 - `known_miscategorized_patterns` in `categories.yaml` exists because
   `update_recurring_pattern` has been observed to intermittently reject
   `confirmed: true`; this is handled with retry/backoff, falling back to a
   manual-review log entry if it keeps failing.
-- Rate limits for both MCP servers are unknown; exponential backoff is
-  implemented defensively in `mcp_clients/base.py`.
+- The retroactive-balance sign convention for credit cards (whether Visor's
+  `balance` field wants the amount owed as positive or negative) was set
+  based on how it's normally displayed, not confirmed against a real
+  populated account -- check a card's balance in the app after the first
+  `migrate` run.

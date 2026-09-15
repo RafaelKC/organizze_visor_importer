@@ -19,6 +19,11 @@ class OrganizzeClient(BaseMcpClient):
     async def get_account_context(self) -> Any:
         return await self.call_tool("get_account_context", {})
 
+    async def list_credit_cards(self) -> Any:
+        """Unlike get_account_context's compact id<->name list, this includes
+        billing_cycle days and limit -- needed to create matching Visor accounts."""
+        return await self.call_tool("list_credit_cards", {})
+
     async def get_balances(self) -> Any:
         return await self.call_tool("get_balances", {})
 

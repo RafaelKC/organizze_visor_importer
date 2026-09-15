@@ -38,6 +38,16 @@ class McpToolError(RuntimeError):
     """Erro retornado pela tool remota (não um erro de transporte)."""
 
 
+class RateLimitError(RuntimeError):
+    """O servidor recusou a escrita por limite de taxa (ex.: "200 changes per
+    hour"). Vem como texto normal (não `isError`), então precisa ser
+    detectado explicitamente -- e nunca vale a pena reintentar na hora, já
+    que a causa não passa com um retry imediato."""
+
+
+_RATE_LIMIT_MARKERS = ("changes per hour", "rate limit", "try again in a few minutes")
+
+
 class BaseMcpClient:
     """Mantém uma sessão MCP viva e expõe `call_tool` com backoff.
 
@@ -84,7 +94,17 @@ class BaseMcpClient:
                 if getattr(result, "isError", False):
                     message = _extract_text(result)
                     raise McpToolError(f"{name}: {message}")
-                return _extract_payload(result)
+                payload = _extract_payload(result)
+                if isinstance(payload, str) and any(m in payload.lower() for m in _RATE_LIMIT_MARKERS):
+                    # Comes back as ordinary (non-error) text content, not a
+                    # tool error -- e.g. a plain string instead of the
+                    # expected JSON object. Retrying immediately can't help,
+                    # so this skips the backoff loop entirely and lets the
+                    # caller decide whether to pause/stop the whole batch.
+                    raise RateLimitError(payload)
+                return payload
+            except RateLimitError:
+                raise
             except McpToolError as exc:
                 # erros funcionais (ex.: "No approval received") merecem retry
                 # com backoff, mas não devem travar o pipeline inteiro se

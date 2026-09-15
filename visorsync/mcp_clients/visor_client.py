@@ -4,10 +4,17 @@ Todas as tools de escrita exigem `confirmed: true` + `idempotency_key` únicos
 por chamada real (reusar a key só em retry da mesma operação lógica) —
 por isso todo método de escrita aqui recebe `idempotency_key` explicitamente
 em vez de gerar um novo a cada chamada.
+
+Every Visor tool also accepts an optional `space_id`: reads without one use
+whatever space happens to be "active" (which can silently differ between
+runs), and writes for a user with more than one space *require* it. To
+avoid depending on an ambient "active space" that can drift, `space_id` is
+injected into every call here automatically when `settings.visor_space_id`
+is set (see `config.py` and `commands/sync_structure.py`'s space check).
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from visorsync.auth.visor_auth import flow as visor_flow
 from visorsync.config import Settings
@@ -21,6 +28,17 @@ class VisorClient(BaseMcpClient):
             mcp_url=settings.visor_mcp_url,
             token_provider=lambda: auth_flow.get_valid_token().access_token,
         )
+        self._space_id: Optional[str] = settings.visor_space_id
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        if self._space_id and "space_id" not in arguments:
+            arguments = {**arguments, "space_id": self._space_id}
+        return await super().call_tool(name, arguments)
+
+    # -- espaços ------------------------------------------------------
+
+    async def list_spaces(self) -> Any:
+        return await self.call_tool("list_spaces", {})
 
     # -- leitura ------------------------------------------------------
 

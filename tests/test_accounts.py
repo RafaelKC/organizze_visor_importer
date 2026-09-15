@@ -12,7 +12,7 @@ def test_matches_names_across_different_unicode_normal_forms():
     assert nfc_name != nfd_name  # sanity check that the test setup is meaningful
 
     resolved, unresolved = resolve_accounts(
-        [], [nfd_name], [], [{"id": "card-1", "name": nfc_name}]
+        [], [nfd_name], [{"id": "card-1", "name": nfc_name}]
     )
 
     assert unresolved == []
@@ -22,7 +22,7 @@ def test_matches_names_across_different_unicode_normal_forms():
 
 def test_name_overrides_bridge_a_real_naming_mismatch():
     resolved, unresolved = resolve_accounts(
-        ["Conta Inter"], [], [{"id": "acc-1", "name": "Inter"}], [],
+        ["Conta Inter"], [], [{"id": "acc-1", "name": "Inter"}],
         name_overrides={"Conta Inter": "Inter"},
     )
 
@@ -32,7 +32,7 @@ def test_name_overrides_bridge_a_real_naming_mismatch():
 
 def test_unmapped_account_is_reported_not_guessed():
     resolved, unresolved = resolve_accounts(
-        ["Conta Inter"], [], [{"id": "acc-1", "name": "Inter"}], []
+        ["Conta Inter"], [], [{"id": "acc-1", "name": "Inter"}]
     )
 
     assert resolved == []

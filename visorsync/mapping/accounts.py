@@ -1,11 +1,16 @@
-"""Resolves Organizze accounts/cards to existing Visor accounts/cards.
+"""Resolves Organizze accounts/cards to existing Visor accounts.
 
 No personal account IDs, credit limits or balances are hardcoded here, in
-code or in any config file. `sync_structure` fetches the live account/card
-lists from both MCP servers every run, matches them by name, and caches the
+code or in any config file. `sync_structure` fetches the live account list
+from both MCP servers every run, matches them by name, and caches the
 resolved `organizze_name <-> visor_id` pair in state.db -- which is local
 and already gitignored. This module only knows *how to match*, never *what
 the values are*.
+
+Note: Visor's `get_cards()` tool is about named cardholders' physical card
+numbers (for "how much did person X spend"), not credit-card accounts --
+a credit card is just a regular account from `get_accounts()` with
+`type: "CREDIT"`. Only `get_accounts()` is used here.
 """
 from __future__ import annotations
 
@@ -40,10 +45,9 @@ def resolve_accounts(
     organizze_account_names: list[str],
     organizze_card_names: list[str],
     visor_accounts: list[dict],
-    visor_cards: list[dict],
     name_overrides: Optional[dict[str, str]] = None,
 ) -> tuple[list[ResolvedAccount], list[str]]:
-    """Match each Organizze account/card to a Visor account/card by name.
+    """Match each Organizze account/card to a Visor account by name.
 
     `name_overrides` optionally maps an Organizze name to the Visor name to
     match against, for cases where the same account was named differently
@@ -51,15 +55,13 @@ def resolve_accounts(
     This holds only text labels -- no IDs or amounts -- so it's safe to keep
     as a small local override file if it's ever needed; most setups won't.
 
-    Returns (resolved, unresolved_names). Unresolved accounts/cards are
-    reported by the caller (never auto-created or silently skipped), since
-    accounts/cards are expected to already exist in Visor before this runs.
+    Returns (resolved, unresolved_names). Unresolved names are reported by
+    the caller, which decides whether to create them or just warn.
     """
     # Normalize override keys too, so a whitespace/case difference in the
     # yaml doesn't have to exactly match the raw Organizze name byte-for-byte.
     overrides = {_normalize(k): v for k, v in (name_overrides or {}).items()}
     visor_by_name: dict[str, dict] = {_normalize(a["name"]): a for a in visor_accounts}
-    visor_by_name.update({_normalize(c["name"]): c for c in visor_cards})
 
     resolved: list[ResolvedAccount] = []
     unresolved: list[str] = []
@@ -88,9 +90,9 @@ def resolve_accounts(
                 kind="credit",
                 visor_id=match["id"],
                 visor_name=match["name"],
-                closing_day=match.get("closing_day"),
-                due_day=match.get("due_day"),
-                limit_cents=match.get("limit_cents"),
+                closing_day=match.get("billing_cycle_close_day", match.get("closing_day")),
+                due_day=match.get("billing_cycle_due_day", match.get("due_day")),
+                limit_cents=match.get("credit_limit", match.get("limit_cents")),
             )
         )
 

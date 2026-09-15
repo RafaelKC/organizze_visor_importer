@@ -28,6 +28,7 @@ class Settings:
     state_db_path: Path
     ambiguous_report_path: Path
     config_dir: Path
+    visor_space_id: str | None
 
     @property
     def organizze_token_path(self) -> Path:
@@ -52,6 +53,7 @@ def load_settings() -> Settings:
         state_db_path=home / "state.db",
         ambiguous_report_path=home / "ambiguous_installments.json",
         config_dir=home / "config",
+        visor_space_id=os.environ.get("VISOR_SPACE_ID") or None,
     )
 
 

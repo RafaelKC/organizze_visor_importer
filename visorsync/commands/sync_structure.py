@@ -1,10 +1,14 @@
 """Phase 1: accounts, cards and categories -- idempotent.
 
-Does not create accounts/cards from scratch (that was done manually);
-resolves them against the live Visor account/card list by name (see
-`mapping/accounts.py`) and registers the match in state.db. Creates the
-custom categories that don't exist yet and hides the listed system
-categories, both idempotently (checks `get_categories` before acting).
+Resolves Organizze accounts/cards against the live Visor account list by
+name (see `mapping/accounts.py`) and registers the match in state.db. If
+one doesn't exist yet in Visor -- whether because it was never created or
+because it was removed (e.g. by `reset-visor --include-manual`) -- it's
+created here via `create_manual_account`, using Organizze's own billing
+days/limit for credit cards, tracked as created_by_tool=True so a later
+reset can clean it up again. Creates the custom categories that don't
+exist yet and hides the listed system categories, both idempotently
+(checks `get_categories` before acting).
 """
 from __future__ import annotations
 
@@ -16,6 +20,7 @@ from rich.console import Console
 from visorsync.config import Settings
 from visorsync.mapping.accounts import load_name_overrides, resolve_accounts
 from visorsync.mapping.categories import load_category_config
+from visorsync.mapping.money import parse_brl
 from visorsync.mcp_clients.organizze_client import OrganizzeClient
 from visorsync.mcp_clients.visor_client import VisorClient
 from visorsync.state.store import StateStore
@@ -35,25 +40,69 @@ async def run(settings: Settings, store: StateStore, *, dry_run: bool = False) -
         organizze_accounts = [a["name"] for a in context.get("accounts", []) if isinstance(a, dict)]
         organizze_cards = [c["name"] for c in context.get("credit_cards", []) if isinstance(c, dict)]
 
+        # Billing days/limit aren't in get_account_context's compact summary
+        # -- only list_credit_cards has them. Keyed by name for the creation
+        # step below, which needs them for any unresolved card.
+        card_details = {c["name"]: c for c in (await organizze.list_credit_cards()).get("credit_cards", [])}
+
         visor_accounts_resp = await visor.get_accounts()
-        visor_cards_resp = await visor.get_cards()
         visor_accounts = [a for a in visor_accounts_resp.get("accounts", visor_accounts_resp) if isinstance(a, dict)]
-        visor_cards = [c for c in visor_cards_resp.get("cards", visor_cards_resp) if isinstance(c, dict)]
 
         name_overrides = load_name_overrides(settings.config_dir)
         resolved, unresolved = resolve_accounts(
-            organizze_accounts, organizze_cards, visor_accounts, visor_cards, name_overrides
+            organizze_accounts, organizze_cards, visor_accounts, name_overrides
         )
 
         if unresolved:
-            visor_names = sorted({a.get("name") for a in visor_accounts} | {c.get("name") for c in visor_cards})
             console.print(
-                f"[dim]debug: Visor account/card names seen: {[repr(n) for n in visor_names]}[/dim]"
+                f"[dim]debug: Visor account names seen: {[repr(a.get('name')) for a in visor_accounts]}[/dim]"
             )
         for name in unresolved:
-            console.print(
-                f"[yellow]warning[/yellow]: no Visor account/card named {name!r} found -- "
-                "expected it to already exist (created manually); skipping."
+            console.print(f"account/card not found in Visor, creating: {name!r}")
+            if dry_run:
+                continue
+
+            create_fields: dict[str, object] = {"name": name}
+            if name in card_details:
+                details = card_details[name]
+                create_fields["type"] = "credit"
+                create_fields["billing_cycle_close_day"] = details.get("closing_day")
+                create_fields["billing_cycle_due_day"] = details.get("due_day")
+                create_fields["credit_limit"] = parse_brl(details.get("limit", 0))
+            else:
+                create_fields["type"] = "bank"
+
+            key = _idempotency_key("create_manual_account", name)
+            await visor.create_manual_account(idempotency_key=key, **create_fields)
+            # Output shape of create_manual_account isn't documented -- as
+            # with categories, re-read get_accounts (shape confirmed live)
+            # and match by name rather than guess at the result's fields.
+            refreshed_resp = await visor.get_accounts()
+            refreshed_accounts = refreshed_resp.get("accounts", refreshed_resp) if isinstance(refreshed_resp, dict) else refreshed_resp
+            # Visor may trim whitespace from the name on creation (observed:
+            # Organizze's "Inter Cartão " -> stored as "Inter Cartão") --
+            # compare loosely, same as the account resolver does elsewhere.
+            created = next(
+                (
+                    a
+                    for a in refreshed_accounts
+                    if isinstance(a, dict) and a.get("name", "").strip().casefold() == name.strip().casefold()
+                ),
+                None,
+            )
+            if created is None:
+                console.print(
+                    f"[red]created account {name!r} but couldn't find it again in get_accounts -- "
+                    "check the app and re-run sync-structure.[/red]"
+                )
+                continue
+            store.upsert(
+                "account",
+                created["id"],
+                organizze_id=name,
+                content_hash=_idempotency_key(create_fields.get("type", ""), str(create_fields.get("billing_cycle_close_day")), str(create_fields.get("billing_cycle_due_day")), str(create_fields.get("credit_limit"))),
+                created_by_tool=True,
+                extra_json=json.dumps({"kind": create_fields["type"]}),
             )
 
         for account in resolved:
