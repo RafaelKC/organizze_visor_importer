@@ -55,7 +55,9 @@ def resolve_accounts(
     reported by the caller (never auto-created or silently skipped), since
     accounts/cards are expected to already exist in Visor before this runs.
     """
-    overrides = name_overrides or {}
+    # Normalize override keys too, so a whitespace/case difference in the
+    # yaml doesn't have to exactly match the raw Organizze name byte-for-byte.
+    overrides = {_normalize(k): v for k, v in (name_overrides or {}).items()}
     visor_by_name: dict[str, dict] = {_normalize(a["name"]): a for a in visor_accounts}
     visor_by_name.update({_normalize(c["name"]): c for c in visor_cards})
 
@@ -63,7 +65,8 @@ def resolve_accounts(
     unresolved: list[str] = []
 
     for name in organizze_account_names:
-        match = visor_by_name.get(_normalize(overrides.get(name, name)))
+        target = overrides.get(_normalize(name), name)
+        match = visor_by_name.get(_normalize(target))
         if match is None:
             unresolved.append(name)
             continue
@@ -74,7 +77,8 @@ def resolve_accounts(
         )
 
     for name in organizze_card_names:
-        match = visor_by_name.get(_normalize(overrides.get(name, name)))
+        target = overrides.get(_normalize(name), name)
+        match = visor_by_name.get(_normalize(target))
         if match is None:
             unresolved.append(name)
             continue

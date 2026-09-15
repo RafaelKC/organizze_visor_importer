@@ -45,9 +45,14 @@ async def run(settings: Settings, store: StateStore, *, dry_run: bool = False) -
             organizze_accounts, organizze_cards, visor_accounts, visor_cards, name_overrides
         )
 
+        if unresolved:
+            visor_names = sorted({a.get("name") for a in visor_accounts} | {c.get("name") for c in visor_cards})
+            console.print(
+                f"[dim]debug: Visor account/card names seen: {[repr(n) for n in visor_names]}[/dim]"
+            )
         for name in unresolved:
             console.print(
-                f"[yellow]warning[/yellow]: no Visor account/card named '{name}' found -- "
+                f"[yellow]warning[/yellow]: no Visor account/card named {name!r} found -- "
                 "expected it to already exist (created manually); skipping."
             )
 
