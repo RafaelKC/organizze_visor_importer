@@ -123,6 +123,23 @@ def _tracked_visor_ids(store: StateStore) -> set[str]:
     return {r.visor_id for r in store.list_all()}
 
 
+def _format_amount(raw: object) -> str:
+    """Formats a money value for display without guessing the wrong unit.
+
+    Visor's read tools return this field as `amount` (not `amount_cents`),
+    which -- unlike the values this tool itself constructs when writing --
+    is a plain decimal (e.g. "29.9"), not integer cents. Falls back to the
+    raw value if it isn't parseable, rather than crashing or silently
+    showing a wrong number.
+    """
+    if raw is None:
+        return "?"
+    try:
+        return f"R${float(raw):.2f}"
+    except (TypeError, ValueError):
+        return str(raw)
+
+
 def _pick_indices(prompt: str, count: int) -> list[int]:
     """Pede ao usuário quais itens (por índice, 1-based) apagar.
 
@@ -198,7 +215,7 @@ async def _manual_cleanup(
     if patterns:
         console.print("\n[bold]Recorrências não rastreadas:[/bold]")
         for i, p in enumerate(patterns, start=1):
-            console.print(f"  [{i}] {p.get('name')} — R${p.get('amount', 0) / 100:.2f} — id={p.get('id')}")
+            console.print(f"  [{i}] {p.get('name')} — {_format_amount(p.get('amount'))} — id={p.get('id')}")
         if not dry_run and confirm:
             for i in _pick_indices("Desativar quais? (números separados por vírgula, 'all' ou enter p/ nenhum)", len(patterns)):
                 p = patterns[i - 1]
@@ -239,7 +256,7 @@ async def _manual_cleanup(
             console.print(f"\n[bold]Transações não rastreadas entre {since} e {until}:[/bold]")
             for i, t in enumerate(transactions, start=1):
                 console.print(
-                    f"  [{i}] {t.get('date')} {t.get('description')} R${t.get('amount', 0) / 100:.2f} — id={t.get('id')}"
+                    f"  [{i}] {t.get('date')} {t.get('description')} {_format_amount(t.get('amount'))} — id={t.get('id')}"
                 )
             if not dry_run and confirm:
                 to_delete = _pick_indices(
