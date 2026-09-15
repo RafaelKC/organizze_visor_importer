@@ -149,10 +149,12 @@ def reset_visor(
     you pick exactly which ones to remove -- one confirmed selection per
     group, never an automatic bulk delete of everything untracked.
     """
-    if not settings.state_db_path.exists():
+    if not settings.state_db_path.exists() and not include_manual:
         typer.secho(
             "state.db is missing -- refusing to run an automatic reset without it. "
-            "Review and remove entities manually in the Visor app instead.",
+            "Nothing is tracked as created by this tool yet, so there's nothing safe "
+            "to auto-delete. Use --include-manual to review and pick entities to "
+            "remove by hand instead of guessing.",
             fg=typer.colors.RED,
         )
         raise typer.Exit(code=1)
